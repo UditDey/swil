@@ -2,4 +2,4 @@
 mod xcb;
 
 #[cfg(unix)]
-pub use xcb::*;
+pub use xcb::Window;

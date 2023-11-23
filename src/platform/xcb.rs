@@ -1,159 +1,291 @@
+use std::ptr::NonNull;
 use std::num::NonZeroU32;
 
-use xcb::{x, atoms_struct, Connection, Xid};
-use raw_window_handle::{RawWindowHandle, XcbWindowHandle};
-
-use crate::{
-    Event,
-    EventInfo,
-    MouseButton,
-    WindowConfig,
-    dpi::{PhysicalPosition, PhysicalSize},
-    error::{WindowCreationError, EventLoopError},
+use x11rb::{
+    atom_manager,
+    connection::Connection,
+    xcb_ffi::{self, XCBConnection},
+    wrapper::ConnectionExt as _,
+    properties::WmSizeHints,
+    protocol::{
+        Event as X11Event,
+        xproto::{
+            self,
+            ConnectionExt as _,
+            WindowClass,
+            CreateWindowAux,
+            PropMode,
+            EventMask
+        }
+    }
 };
 
-atoms_struct! {
-    struct Atoms {
-        wm_protocols => b"WM_PROTOCOLS",
-        wm_del_window => b"WM_DELETE_WINDOW",
+use raw_window_handle::{
+    XcbWindowHandle, XcbDisplayHandle,
+    WindowHandle, RawWindowHandle,
+    DisplayHandle, RawDisplayHandle
+};
+
+use crate::{
+    WindowConfig,
+    Error,
+    dpi::{Size, PhysicalSize, PhysicalPosition},
+    event::{Event, KeyboardInput, MouseInput, MouseButton, ButtonState}
+};
+
+atom_manager! {
+    pub AtomSet: AtomSetCookie {
+        WM_PROTOCOLS,
+        WM_DELETE_WINDOW,
+        _MOTIF_WM_HINTS,
     }
 }
 
 pub struct Window {
-    conn: Connection,
-    window: x::Window,
-    atoms: Atoms,
-    scale_factor: f32
+    conn: XCBConnection,
+    screen: i32,
+    window: u32,
+    scale_factor: f32,
+    atoms: AtomSet
 }
 
 impl Window {
-    pub fn new(config: &WindowConfig) -> Result<Self, WindowCreationError> {
-        let (conn, screen_num) = Connection::connect(None).map_err(|err| WindowCreationError::XcbConnectionFailed(err))?;
+    pub fn new(config: &WindowConfig) -> Result<Self, Error> {
+        // Load libxcb
+        xcb_ffi::load_libxcb().map_err(|err| Error::XcbLoadFailed(err))?;
 
-        let setup = conn.get_setup();
-        let window = conn.generate_id::<x::Window>();
-        let screen = setup.roots().nth(screen_num as usize).ok_or(WindowCreationError::XcbScreenNotFound)?;
+        // Connect to X11 server
+        let (conn, screen_num) = XCBConnection::connect(None).map_err(|err| Error::X11ConnectionFailed(err))?;
+        let screen = &conn.setup().roots[screen_num];
 
-        let scale_factor = 1.0;
-        let size = config.size.to_physical(scale_factor);
+        // Get needed atoms
+        let atoms = AtomSet::new(&conn)
+            .map_err(|err| Error::X11AtomFetchFailed(err))?
+            .reply()
+            .map_err(|err| Error::X11AtomReplyError(err))?;
 
-        let event_mask = x::EventMask::KEY_PRESS |
-                         x::EventMask::KEY_RELEASE |
-                         x::EventMask::ENTER_WINDOW |
-                         x::EventMask::LEAVE_WINDOW |
-                         x::EventMask::POINTER_MOTION |
-                         x::EventMask::BUTTON_PRESS |
-                         x::EventMask::BUTTON_RELEASE |
-                         x::EventMask::RESIZE_REDIRECT;
+        // Get scale factor
+        // Try to get Xft.dpi
+        let xft_dpi = x11rb::resource_manager::new_from_default(&conn)
+            .ok()
+            .map(|db| db.get_value::<u32>("Xft.dpi", "").ok())
+            .flatten()
+            .flatten();
 
-        conn.send_request(&x::CreateWindow {
-            depth: x::COPY_FROM_PARENT as u8,
-            wid: window,
-            parent: screen.root(),
-            x: 0,
-            y: 0,
-            width: size.width as u16,
-            height: size.height as u16,
-            border_width: 10,
-            class: x::WindowClass::InputOutput,
-            visual: screen.root_visual(),
-            value_list: &[
-                x::Cw::BackPixel(screen.black_pixel()),
-                x::Cw::EventMask(event_mask),
-            ],
-        });
+        let scale_factor = match xft_dpi {
+            Some(dpi) => dpi as f32 / 96.0,
 
-        conn.send_request(&x::ChangeProperty {
-            mode: x::PropMode::Replace,
+            None => {
+                // Calculate screen's physical DPI
+                // This approach is taken from winit: https://github.com/rust-windowing/winit/blob/7bed5eecfdcbde16e5619fd137f0229e8e7e8ed4/src/platform_impl/linux/x11/util/randr.rs#L16
+                let ppmm = (
+                    (screen.width_in_pixels as f32 * screen.height_in_pixels as f32) /
+                    (screen.width_in_millimeters as f32 * screen.height_in_millimeters as f32)
+                ).sqrt();
+
+                // Quantize 1/12 step size
+                let dpi_factor = ((ppmm * (12.0 * 25.4 / 96.0)).round() / 12.0).max(1.0);
+
+                if dpi_factor <= 20.0 {
+                    dpi_factor
+                } else {
+                    1.0
+                }
+            }
+        };
+
+        // Calculate window physical size
+        let size = match &config.size {
+            Size::Logical(size) => size.to_physical(scale_factor),
+            Size::Physical(size) => size.clone()
+        };
+
+        // Create window
+        let window = conn.generate_id().map_err(|err| Error::X11GenerateIdFailed(err))?;
+
+        let event_mask = EventMask::KEY_PRESS |
+                         EventMask::KEY_RELEASE |
+                         EventMask::ENTER_WINDOW |
+                         EventMask::LEAVE_WINDOW |
+                         EventMask::POINTER_MOTION |
+                         EventMask::BUTTON_PRESS |
+                         EventMask::BUTTON_RELEASE |
+                         EventMask::RESIZE_REDIRECT |
+                         EventMask::FOCUS_CHANGE;
+
+        let aux = CreateWindowAux::new()
+            .background_pixel(screen.black_pixel)
+            .event_mask(event_mask);
+
+        conn.create_window(
+            x11rb::COPY_DEPTH_FROM_PARENT,
             window,
-            property: x::ATOM_WM_NAME,
-            r#type: x::ATOM_STRING,
-            data: config.title.as_bytes(),
-        });
+            screen.root,
+            0,
+            0,
+            size.width as u16,
+            size.height as u16,
+            0,
+            WindowClass::INPUT_OUTPUT,
+            0,
+            &aux
+        ).map_err(|err| Error::X11CreateWindowFailed(err))?;
 
-        let atoms = Atoms::intern_all(&conn).map_err(|err| WindowCreationError::XcbAtomInternFailed(err))?;
-
-        conn.send_request(&x::ChangeProperty {
-            mode: x::PropMode::Replace,
+        // Set title
+        conn.change_property8(
+            PropMode::REPLACE,
             window,
-            property: atoms.wm_protocols,
-            r#type: x::ATOM_ATOM,
-            data: &[atoms.wm_del_window],
-        });
+            xproto::AtomEnum::WM_NAME,
+            xproto::AtomEnum::STRING,
+            config.title.as_bytes()
+        ).map_err(|err| Error::X11SetTitleFailed(err))?;
 
-        conn.send_request(&x::MapWindow { window });
-    
-        conn.flush().map_err(|err| WindowCreationError::XcbFlushFailed(err))?;
+        // Hook window close event
+        conn.change_property32(
+            PropMode::REPLACE,
+            window,
+            atoms.WM_PROTOCOLS,
+            xproto::AtomEnum::ATOM,
+            &[atoms.WM_DELETE_WINDOW]
+        ).map_err(|err| Error::X11WindowCloseHookFailed(err))?;
+
+        // Set size hints if not resizable
+        if !config.resizable {
+            let hints = WmSizeHints {
+                min_size: Some((size.width as i32, size.height as i32)),
+                max_size: Some((size.width as i32, size.height as i32)),
+                ..Default::default()
+            };
+
+            hints
+                .set_normal_hints(&conn, window)
+                .map_err(|err| Error::X11SetSizeHintsFailed(err))?;
+        }
+
+        // Show window if needed
+        if config.visible {
+            conn.map_window(window).map_err(|err| Error::X11MapWindowFailed(err))?;
+        }
+
+        conn.flush().map_err(|err| Error::X11FlushFailed(err))?;
+
+        let screen = screen.root as i32;
 
         Ok(Self {
             conn,
+            screen,
             window,
-            atoms,
-            scale_factor
+            scale_factor,
+            atoms
         })
     }
 
-    pub fn handle(&self) -> RawWindowHandle {
-        let window = NonZeroU32::new(self.window.resource_id()).unwrap();
-        RawWindowHandle::Xcb(XcbWindowHandle::new(window))
+    pub fn set_title(&self, title: &str) -> Result<(), Error> {
+        self.conn.change_property8(
+            PropMode::REPLACE,
+            self.window,
+            xproto::AtomEnum::WM_NAME,
+            xproto::AtomEnum::STRING,
+            title.as_bytes()
+        ).map_err(|err| Error::X11SetTitleFailed(err))?;
+
+        self.conn.flush().map_err(|err| Error::X11FlushFailed(err))
     }
 
-    pub fn event_loop(&self, func: impl Fn(&mut EventInfo)) -> Result<(), EventLoopError> {
+    pub fn set_visible(&self, visible: bool) -> Result<(), Error> {
+        if visible {
+            self.conn.map_window(self.window).map_err(|err| Error::X11MapWindowFailed(err))?;
+        }
+        else {
+            self.conn.unmap_window(self.window).map_err(|err| Error::X11MapWindowFailed(err))?;
+        }
+
+        self.conn.flush().map_err(|err| Error::X11FlushFailed(err))
+    }
+
+    pub fn scale_factor(&self) -> f32 {
+        self.scale_factor
+    }
+
+    pub fn window_handle(&self) -> WindowHandle {
+        let window = NonZeroU32::new(self.window).unwrap();
+        let handle = RawWindowHandle::Xcb(XcbWindowHandle::new(window));
+
+        unsafe { WindowHandle::borrow_raw(handle) }
+    }
+
+    pub fn display_handle(&self) -> DisplayHandle {
+        let conn = NonNull::new(self.conn.get_raw_xcb_connection());
+        let handle = RawDisplayHandle::Xcb(XcbDisplayHandle::new(conn, self.screen));
+
+        unsafe { DisplayHandle::borrow_raw(handle) }
+    }
+
+    pub fn event_loop(&self, func: impl Fn(Event, &mut bool)) -> Result<(), Error> {
         loop {
-            let event = self.conn.wait_for_event().map_err(|err| EventLoopError::XcbWaitForEventFailed(err))?;
+            let x11_event = self.conn.wait_for_event().map_err(|err| Error::X11WaitForEventFailed(err))?;
 
-            let event = match event {
-                xcb::Event::X(x::Event::KeyPress(event)) => Some(Event::KeyPressed(event.detail() as u16)),
-                xcb::Event::X(x::Event::KeyRelease(event)) => Some(Event::KeyReleased(event.detail() as u16)),
+            let event = match x11_event {
+                X11Event::ResizeRequest(event) => Some(Event::Resized(PhysicalSize { width: event.width as u32, height: event.height as u32 })),
                 
-                xcb::Event::X(x::Event::EnterNotify(_)) => Some(Event::MouseEntered),
-                xcb::Event::X(x::Event::LeaveNotify(_)) => Some(Event::MouseLeft),
-                xcb::Event::X(x::Event::MotionNotify(event)) => {
-                    let pos = PhysicalPosition {
-                        x: event.event_x() as u32,
-                        y: event.event_y() as u32
-                    };
-                    
-                    Some(Event::MouseMoved(pos.to_logical(self.scale_factor)))
-                },
-                xcb::Event::X(x::Event::ButtonPress(event)) => Some(Event::MouseButtonPressed(map_mouse_button(event.detail()))),
-                xcb::Event::X(x::Event::ButtonRelease(event)) => Some(Event::MouseButtonReleased(map_mouse_button(event.detail()))),
-                xcb::Event::X(x::Event::ResizeRequest(event)) => {
-                    let size = PhysicalSize {
-                        width: event.width() as u32,
-                        height: event.height() as u32
-                    };
+                X11Event::ClientMessage(event) => {
+                    let data = event.data.as_data32();
 
-                    Some(Event::Resized(size.to_logical(self.scale_factor)))
-                },
-                xcb::Event::X(x::Event::ClientMessage(event)) => {
-                    if let x::ClientMessageData::Data32([atom, ..]) = event.data() {
-                        if atom == self.atoms.wm_del_window.resource_id() {
-                            Some(Event::ShouldClose)
-                        }
-                        else {
-                            None
-                        }
+                    if event.format == 32 && data[0] == self.atoms.WM_DELETE_WINDOW {
+                        Some(Event::CloseRequested)
                     }
                     else {
                         None
                     }
                 },
 
+                X11Event::FocusIn(_) => Some(Event::FocusChanged(true)),
+                X11Event::FocusOut(_) => Some(Event::FocusChanged(false)),
+
+                X11Event::KeyPress(event) => {
+                    Some(Event::KeyboardInput(KeyboardInput {
+                        code: event.detail,
+                        state: ButtonState::Pressed,
+                        text: None
+                    }))
+                },
+
+                X11Event::KeyRelease(event) => {
+                    Some(Event::KeyboardInput(KeyboardInput {
+                        code: event.detail,
+                        state: ButtonState::Released,
+                        text: None
+                    }))
+                },
+
+                X11Event::MotionNotify(event) => Some(Event::CursorMoved(PhysicalPosition { x: event.event_x as u32, y: event.event_y as u32 })),
+
+                X11Event::LeaveNotify(_) => Some(Event::CursorLeft),
+                X11Event::EnterNotify(_) => Some(Event::CursorEntered),
+
+                X11Event::ButtonPress(event) => {
+                    Some(Event::MouseInput(MouseInput {
+                        button: map_mouse_button(event.detail),
+                        state: ButtonState::Pressed
+                    }))
+                },
+
+                X11Event::ButtonRelease(event) => {
+                    Some(Event::MouseInput(MouseInput {
+                        button: map_mouse_button(event.detail),
+                        state: ButtonState::Released
+                    }))
+                },
+
                 _ => None
             };
 
             if let Some(event) = event {
-                let mut info = EventInfo {
-                    event,
-                    scale_factor: self.scale_factor,
-                    exit: false
-                };
-                
-                func(&mut info);
+                let mut exit = false;
+                func(event, &mut exit);
 
-                if info.exit {
-                    return Ok(());
+                if exit {
+                    return Ok(())
                 }
             }
         }
@@ -162,11 +294,11 @@ impl Window {
 
 impl Drop for Window {
     fn drop(&mut self) {
-        self.conn.send_request(&x::DestroyWindow { window: self.window });
+        self.conn.destroy_window(self.window).unwrap();
     }
 }
 
-fn map_mouse_button(button: xcb::x::Button) -> MouseButton {
+fn map_mouse_button(button: u8) -> MouseButton {
     match button {
         1 => MouseButton::Left,
         2 => MouseButton::Middle,
