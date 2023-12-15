@@ -19,15 +19,11 @@ pub struct KeyboardInput<'a> {
 
 /// A mouse scroll event
 #[derive(Debug, Clone)]
-pub enum MouseWheelDelta {
-    /// Amount in lines or rows to scroll in the horizontal and vertical directions
-    /// 
-    /// Positive values mean that the content should be scrolled right/down.
-    /// This is produced by physical mouse wheels
-    LineDelta(u32, u32),
-
-    /// Amount in physical pixel units to scroll in the horizontal and vertical directions
-    PixelDelta(PhysicalPosition)
+pub enum MouseScroll {
+    Up,
+    Down,
+    Left,
+    Right
 }
 
 /// A mouse button
@@ -80,8 +76,8 @@ pub enum Event<'a> {
     /// The cursor has left the window
     CursorLeft,
 
-    /// A mouse wheel movement or touchpad scroll has occurred
-    MouseWheel(MouseWheelDelta),
+    /// A mouse or touchpad scroll has occurred
+    MouseScroll(MouseScroll),
 
     /// A mouse button event has occurred
     MouseInput(MouseInput)

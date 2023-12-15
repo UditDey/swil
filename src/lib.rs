@@ -14,7 +14,7 @@ use raw_window_handle::{
 
 pub use error::Error;
 
-use dpi::{Size, LogicalSize};
+use dpi::{Size, LogicalSize, PhysicalSize};
 use event::Event;
 
 /// Initial configuration of a window
@@ -42,7 +42,7 @@ impl<'a> WindowConfig<'a> {
     /// 
     /// The default value is "swil window"
     /// 
-    /// This can be later changed with [`Window::set_title()`]
+    /// This can later be changed with [`Window::set_title()`]
     pub fn title(mut self, title: &'a str) -> Self {
         self.title = title;
         self
@@ -63,16 +63,20 @@ impl<'a> WindowConfig<'a> {
     /// Sets whether the window will be resizable when created
     /// 
     /// The default is `true`
+    /// 
+    /// This can later be changed with [`Window::set_resizable()`]
     pub fn resizable(mut self, resizable: bool) -> Self {
         self.resizable = resizable;
         self
     }
 
-    /// Sets the inital size of the window
+    /// Sets the inital inner size of the window
     /// 
     /// The default value is `(600.0, 400.0)` logical units
     /// 
     /// This represents the inner size of the window, excluding the size of decorations
+    /// 
+    /// This can later be retrieved with [`Window::size()`]
     pub fn size(mut self, size: Size) -> Self {
         self.size = size;
         self
@@ -101,6 +105,16 @@ impl Window {
     /// Sets whether the window is visible
     pub fn set_visible(&self, visibile: bool) -> Result<(), Error> {
         self.inner.set_visible(visibile)
+    }
+
+    /// Sets whether the window is resizable
+    pub fn set_resizable(&self, resizable: bool) -> Result<(), Error> {
+        self.inner.set_resizable(resizable)
+    }
+
+    /// Gets the current inner size of the window
+    pub fn size(&self) -> Result<PhysicalSize, Error> {
+        self.inner.size()
     }
 
     /// Gets the window's current scale factor

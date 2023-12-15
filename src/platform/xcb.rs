@@ -1,3 +1,4 @@
+use std::cell::Cell;
 use std::ptr::NonNull;
 use std::num::NonZeroU32;
 
@@ -30,14 +31,13 @@ use crate::{
     WindowConfig,
     Error,
     dpi::{Size, PhysicalSize, PhysicalPosition},
-    event::{Event, KeyboardInput, MouseInput, MouseButton, ButtonState}
+    event::{Event, KeyboardInput, MouseInput, MouseButton, ButtonState, MouseScroll}
 };
 
 atom_manager! {
     pub AtomSet: AtomSetCookie {
         WM_PROTOCOLS,
         WM_DELETE_WINDOW,
-        _MOTIF_WM_HINTS,
     }
 }
 
@@ -46,7 +46,8 @@ pub struct Window {
     screen: i32,
     window: u32,
     scale_factor: f32,
-    atoms: AtomSet
+    atoms: AtomSet,
+    size: Cell<PhysicalSize>
 }
 
 impl Window {
@@ -176,7 +177,8 @@ impl Window {
             screen,
             window,
             scale_factor,
-            atoms
+            atoms,
+            size: Cell::new(size)
         })
     }
 
@@ -203,6 +205,38 @@ impl Window {
         self.conn.flush().map_err(|err| Error::X11FlushFailed(err))
     }
 
+    pub fn set_resizable(&self, resizable: bool) -> Result<(), Error> {
+        let hints = if !resizable {
+            let size = self.size()?;
+
+            WmSizeHints {
+                min_size: Some((size.width as i32, size.height as i32)),
+                max_size: Some((size.width as i32, size.height as i32)),
+                ..Default::default()
+            }
+        }
+        else {
+            WmSizeHints {
+                min_size: None,
+                max_size: None,
+                ..Default::default()
+            }
+        };
+
+        hints
+            .set_normal_hints(&self.conn, self.window)
+            .map_err(|err| Error::X11SetSizeHintsFailed(err))?;
+
+        self.conn.flush().map_err(|err| Error::X11FlushFailed(err))
+    }
+
+    pub fn size(&self) -> Result<PhysicalSize, Error> {
+        let size = self.size.replace(PhysicalSize { width: 0, height: 0 });
+        self.size.set(size.clone());
+
+        Ok(size)
+    }
+
     pub fn scale_factor(&self) -> f32 {
         self.scale_factor
     }
@@ -226,7 +260,12 @@ impl Window {
             let x11_event = self.conn.wait_for_event().map_err(|err| Error::X11WaitForEventFailed(err))?;
 
             let event = match x11_event {
-                X11Event::ResizeRequest(event) => Some(Event::Resized(PhysicalSize { width: event.width as u32, height: event.height as u32 })),
+                X11Event::ResizeRequest(event) => {
+                    let new_size = PhysicalSize { width: event.width as u32, height: event.height as u32 };
+                    self.size.set(new_size.clone());
+
+                    Some(Event::Resized(new_size))
+                },
                 
                 X11Event::ClientMessage(event) => {
                     let data = event.data.as_data32();
@@ -263,19 +302,8 @@ impl Window {
                 X11Event::LeaveNotify(_) => Some(Event::CursorLeft),
                 X11Event::EnterNotify(_) => Some(Event::CursorEntered),
 
-                X11Event::ButtonPress(event) => {
-                    Some(Event::MouseInput(MouseInput {
-                        button: map_mouse_button(event.detail),
-                        state: ButtonState::Pressed
-                    }))
-                },
-
-                X11Event::ButtonRelease(event) => {
-                    Some(Event::MouseInput(MouseInput {
-                        button: map_mouse_button(event.detail),
-                        state: ButtonState::Released
-                    }))
-                },
+                X11Event::ButtonPress(event) => map_button_event(event.detail, ButtonState::Pressed),
+                X11Event::ButtonRelease(event) => map_button_event(event.detail, ButtonState::Released),
 
                 _ => None
             };
@@ -298,11 +326,40 @@ impl Drop for Window {
     }
 }
 
-fn map_mouse_button(button: u8) -> MouseButton {
+fn map_button_event<'a>(button: u8, state: ButtonState) -> Option<Event<'a>> {
     match button {
-        1 => MouseButton::Left,
-        2 => MouseButton::Middle,
-        3 => MouseButton::Right,
-        other => MouseButton::Other(other as u8)
+        1 => Some(Event::MouseInput(MouseInput { button: MouseButton::Left, state })),
+        2 => Some(Event::MouseInput(MouseInput { button: MouseButton::Middle, state })),
+        3 => Some(Event::MouseInput(MouseInput { button: MouseButton::Right, state })),
+
+        4 => if let ButtonState::Pressed = state {
+            Some(Event::MouseScroll(MouseScroll::Up))
+        }
+        else {
+            None
+        },
+
+        5 => if let ButtonState::Pressed = state {
+            Some(Event::MouseScroll(MouseScroll::Down))
+        }
+        else {
+            None
+        },
+
+        6 => if let ButtonState::Pressed = state {
+            Some(Event::MouseScroll(MouseScroll::Left))
+        }
+        else {
+            None
+        },
+
+        7 => if let ButtonState::Pressed = state {
+            Some(Event::MouseScroll(MouseScroll::Right))
+        }
+        else {
+            None
+        },
+
+        other => Some(Event::MouseInput(MouseInput { button: MouseButton::Other(other), state }))
     }
 }
